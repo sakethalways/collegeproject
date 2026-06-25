@@ -128,12 +128,35 @@ function extractJSON(text) {
   throw new Error("Could not extract valid JSON from Gemini response");
 }
 
-// ─── Gemini analysis ───
+// ─── Gemini analysis with retry + model fallback ───
+const MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-pro-latest"];
+
+async function callGeminiWithRetry(prompt) {
+  for (const modelName of MODELS) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`Trying ${modelName} (attempt ${attempt})...`);
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: { responseMimeType: "application/json" },
+        });
+        const result = await model.generateContent(prompt);
+        return result.response.text().trim();
+      } catch (err) {
+        const isRetryable = err.message.includes("503") || err.message.includes("overloaded") || err.message.includes("high demand") || err.message.includes("429");
+        console.warn(`${modelName} attempt ${attempt} failed: ${err.message.slice(0, 80)}`);
+        if (isRetryable && attempt < 3) {
+          await new Promise(r => setTimeout(r, attempt * 3000));
+        } else if (!isRetryable) {
+          break; // non-retryable error on this model, try next
+        }
+      }
+    }
+  }
+  throw new Error("All Gemini models unavailable. Please try again in a moment.");
+}
+
 async function analyzeWithGemini(scrapedData) {
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
-    generationConfig: { responseMimeType: "application/json" },
-  });
 
   const prompt = `You are an expert content auditor, fact-checker, and research analyst. Your mission is to deeply audit a webpage's substantive content using your current knowledge base.
 
@@ -190,14 +213,9 @@ Return ONLY a JSON object (no markdown, no explanation):
   "updatedFullContent": "A complete rewritten version of the page content with all corrections and additions. Write as clean professional prose. No markdown symbols like ** or ## — use plain text only."
 }`;
 
-  const result = await model.generateContent(prompt);
-  const raw = result.response.text().trim();
+  const raw = await callGeminiWithRetry(prompt);
   console.log("Gemini raw (first 500):\n", raw.slice(0, 500));
-
-  // Gemini 2.5 sometimes emits thinking/preamble before the JSON object.
-  // Find the outermost { ... } by matching braces, not just lastIndexOf.
-  const parsed = extractJSON(raw);
-  return parsed;
+  return extractJSON(raw);
 }
 
 // ─── Build Word document ───
